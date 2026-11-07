@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -85,7 +86,7 @@ void main() {
       expect(ka.sendKey, kb.receiveKey);
       expect(ka.receiveKey, kb.sendKey);
       expect(ka.verificationCode, kb.verificationCode);
-      expect(ka.verificationCode, matches(RegExp(r'^[0-9A-Z]{4}-[0-9A-Z]{4}$')));
+      expect(ka.verificationCode, matches(RegExp(r'^[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}$')));
 
       final ca = await SecureChannel.start(ka.sendKey, ka.receiveKey);
       final cb = await SecureChannel.start(kb.sendKey, kb.receiveKey);
@@ -128,6 +129,73 @@ void main() {
       expect(ka.sendKey, isNot(kb.receiveKey));
       final (ka2, kb2) = await pair(pwA: 'gizli123', pwB: 'gizli123');
       expect(ka2.sendKey, kb2.receiveKey);
+    });
+  });
+
+
+  group('attack scenarios', () {
+    test('man-in-the-middle cannot make both sides show the same code', () async {
+      // Ayşe <-> Mallory <-> Burak: Mallory swaps both codes for her own.
+      final sid1 = randomBytes(16), sid2 = randomBytes(16);
+      final ayse = await EphemeralKey.generate();
+      final burak = await EphemeralKey.generate();
+      final m1 = await EphemeralKey.generate(); // Mallory facing Ayşe
+      final m2 = await EphemeralKey.generate(); // Mallory facing Burak
+      final ayseSide = await deriveSessionKeys(
+          mine: ayse, peerEphemeral: m1.publicKey, offerBody: 'O-ayse', answerBody: 'A-mallory',
+          sessionId: sid1, isOfferer: true);
+      final burakSide = await deriveSessionKeys(
+          mine: burak, peerEphemeral: m2.publicKey, offerBody: 'O-mallory', answerBody: 'A-burak',
+          sessionId: sid2, isOfferer: false);
+      expect(ayseSide.verificationCode, isNot(burakSide.verificationCode));
+      // And Mallory cannot read Ayşe->Burak traffic with Burak's keys.
+      expect(ayseSide.sendKey, isNot(burakSide.receiveKey));
+    });
+
+    test('a code signed by someone else cannot carry another identity', () async {
+      final (real, _) = await Identity.generate();
+      final (attacker, _) = await Identity.generate();
+      final eph = await EphemeralKey.generate();
+      final genuine = await ConnectionCode.create(
+          kind: CodeKind.invite, identity: real, sessionId: randomBytes(16), sdp: _sdp,
+          ephemeralKey: eph.publicKey, name: 'Annem', validity: const Duration(minutes: 5));
+      // Attacker re-signs the same body with their key but keeps the victim's
+      // identity key inside: the signature check must fail.
+      final raw = utf8.decode(gzip.decode(unb64(genuine.encoded.substring(5))));
+      final wrapper = jsonDecode(raw) as Map<String, dynamic>;
+      final forgedSig = await attacker.sign(utf8.encode(wrapper['b'] as String));
+      final forged = 'JP1I-${b64(gzip.encode(utf8.encode(jsonEncode({'b': wrapper['b'], 's': b64(forgedSig)}))))}';
+      await expectLater(ConnectionCode.parse(forged), throwsA(isA<CodeException>()));
+
+      // Editing the body (e.g. swapping the ephemeral key) also fails.
+      final body = jsonDecode(wrapper['b'] as String) as Map<String, dynamic>;
+      body['ek'] = b64(randomBytes(32));
+      final edited = 'JP1I-${b64(gzip.encode(utf8.encode(jsonEncode({'b': jsonEncode(body), 's': wrapper['s']}))))}';
+      await expectLater(ConnectionCode.parse(edited), throwsA(isA<CodeException>()));
+    });
+
+    test('low-order / all-zero public keys are rejected', () async {
+      final eph = await EphemeralKey.generate();
+      await expectLater(eph.agree(Uint8List(32)), throwsA(isA<FormatException>()));
+      await expectLater(eph.agree(Uint8List(31)), throwsA(isA<FormatException>()));
+    });
+
+    test('verification code has 60 bits and is not guessable by brute force', () async {
+      final seen = <String>{};
+      for (var i = 0; i < 40; i++) {
+        final a = await EphemeralKey.generate();
+        final b = await EphemeralKey.generate();
+        final k = await deriveSessionKeys(
+            mine: a, peerEphemeral: b.publicKey, offerBody: 'O', answerBody: 'A',
+            sessionId: randomBytes(16), isOfferer: true);
+        expect(seen.add(k.verificationCode), isTrue);
+      }
+    });
+
+    test('gzip bomb inside a code is refused', () async {
+      final bomb = gzip.encode(List<int>.filled(5 * 1024 * 1024, 0x41));
+      await expectLater(
+          ConnectionCode.parse('JP1I-${b64(bomb)}'), throwsA(isA<CodeException>()));
     });
   });
 }

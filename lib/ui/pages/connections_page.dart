@@ -618,7 +618,8 @@ class _SendZoneState extends State<_SendZone> {
             Text('Dosyaları ya da klasörleri buraya sürükle', style: context.tt.titleMedium, textAlign: TextAlign.center),
             const SizedBox(height: 4),
             Text(
-              'Her türlü dosya, her boyutta. Hız iki tarafın internet bağlantısına bağlıdır.',
+              'Her türlü dosya, her boyutta. Fotoğraf ve videolar sıkıştırılmadan, orijinal kalitede gider. '
+              'Hız iki tarafın internet bağlantısına bağlıdır.',
               style: TextStyle(color: jp.textMuted, fontSize: 12.5),
               textAlign: TextAlign.center,
             ),

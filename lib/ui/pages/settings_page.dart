@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../services/platform_actions.dart';
+import '../../services/scanner.dart';
 import '../shell.dart';
 import '../theme.dart';
 import '../widgets/chrome.dart';
@@ -25,6 +26,40 @@ class _SettingsPageState extends State<SettingsPage> {
   late final _turnUrl = TextEditingController(text: context.appRead.settings.turnUrl);
   late final _turnUser = TextEditingController(text: context.appRead.settings.turnUser);
   late final _turnPass = TextEditingController(text: context.appRead.settings.turnPass);
+  late final _vt = TextEditingController(text: context.appRead.settings.virusTotalKey);
+  bool _testing = false;
+
+  /// Scans the harmless EICAR test file to prove the scanner works.
+  Future<void> _testScan() async {
+    final app = context.appRead;
+    setState(() => _testing = true);
+    String title, body;
+    try {
+      final dir = await Directory.systemTemp.createTemp('jp_tarama');
+      final f = File('${dir.path}${Platform.pathSeparator}eicar_test.txt');
+      await f.writeAsString(eicarTestString());
+      final r = await app.scanner.scanFile(f.path, displayName: 'eicar_test.txt', sha256: '');
+      try {
+        await dir.delete(recursive: true);
+      } catch (_) {}
+      if (r == null) {
+        title = 'Tarama kapalı';
+        body = 'Önce "Gelen her dosyayı tara" seçeneğini aç.';
+      } else if (r.isThreat) {
+        title = 'Tarayıcı çalışıyor';
+        body = 'Test dosyası doğru şekilde yakalandı: ${r.summary}';
+      } else {
+        title = 'Beklenmeyen sonuç';
+        body = r.summary;
+      }
+    } catch (e) {
+      title = 'Test yapılamadı';
+      body = '$e';
+    }
+    if (!mounted) return;
+    setState(() => _testing = false);
+    app.notify(title, body, error: title != 'Tarayıcı çalışıyor');
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -87,7 +122,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 child: Row(
                   children: [
                     Expanded(
-                      child: Text(app.downloadDir,
+                      child: Text(Platform.isAndroid ? 'Telefonun İndirilenler klasörü › JinjaPeer' : app.downloadDir,
                           maxLines: 2, overflow: TextOverflow.ellipsis, style: TextStyle(color: jp.textMuted, fontSize: 13)),
                     ),
                     const SizedBox(width: S.sm),
@@ -98,6 +133,7 @@ class _SettingsPageState extends State<SettingsPage> {
                       dense: true,
                       onPressed: () => openFolder(app.downloadDir),
                     ),
+                    if (isDesktop)
                     JButton(
                       label: 'Değiştir',
                       icon: Icons.drive_folder_upload_rounded,
@@ -109,7 +145,7 @@ class _SettingsPageState extends State<SettingsPage> {
                         if (d != null) app.updateSettings((x) => x.downloadDir = d);
                       },
                     ),
-                    if (s.downloadDir.isNotEmpty)
+                    if (isDesktop && s.downloadDir.isNotEmpty)
                       JIconButton(
                         icon: Icons.restart_alt_rounded,
                         tooltip: 'Varsayılana dön',
@@ -118,6 +154,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   ],
                 ),
               ),
+              if (isDesktop)
               _Toggle(
                 title: 'Her seferinde nereye kaydedileceğini sor',
                 value: s.askWhereToSave,
@@ -251,6 +288,58 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           _Section(
             index: 4,
+            icon: Icons.health_and_safety_rounded,
+            title: 'Virüs taraması',
+            children: [
+              _Toggle(
+                title: 'Gelen her dosyayı tara',
+                subtitle: 'Tehdit bulunursa dosya indirme klasörüne yazılmaz, karantinada bekler; '
+                    'silmek ya da yine de kaydetmek sana sorulur.',
+                value: s.scanEnabled,
+                onChanged: (v) => app.updateSettings((x) => x.scanEnabled = v),
+              ),
+              _Field(
+                label: 'Bu cihazdaki tarayıcılar',
+                help: Platform.isAndroid
+                    ? 'Android\'de ücretsiz bir yerel antivirüs motoru yok. JinjaPeer kontrolleri gizlenmiş programları, '
+                        'çift uzantı hilelerini, makroları ve arşivdeki programları yakalar; tam tarama için aşağıya '
+                        'ücretsiz VirusTotal anahtarı ekleyebilirsin.'
+                    : null,
+                child: Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    for (final e in app.scanner.availableEngines())
+                      Pill(e, icon: Icons.check_circle_rounded, color: jp.success),
+                  ],
+                ),
+              ),
+              _Field(
+                label: 'VirusTotal API anahtarı (isteğe bağlı, ücretsiz)',
+                help: 'virustotal.com\'da ücretsiz hesap açıp API anahtarını yapıştırırsan, gelen her dosyanın yalnızca '
+                    'SHA-256 özeti 70\'ten fazla antivirüs motorunun kayıtlarında sorgulanır. Dosyanın kendisi asla yüklenmez.',
+                child: TextField(
+                  controller: _vt,
+                  obscureText: true,
+                  decoration: const InputDecoration(hintText: 'API anahtarı', isDense: true),
+                  onChanged: (v) => app.updateSettings((x) => x.virusTotalKey = v.trim()),
+                ),
+              ),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: JButton(
+                  label: 'Taramayı test et',
+                  icon: Icons.bug_report_outlined,
+                  kind: BtnKind.secondary,
+                  loading: _testing,
+                  tooltip: 'Zararsız EICAR test dosyasıyla tarayıcının çalıştığını doğrular',
+                  onPressed: _testScan,
+                ),
+              ),
+            ],
+          ),
+          _Section(
+            index: 5,
             icon: Icons.security_rounded,
             title: 'Güvenlik ve gizlilik',
             children: [
@@ -287,7 +376,7 @@ class _SettingsPageState extends State<SettingsPage> {
             ],
           ),
           _Section(
-            index: 5,
+            index: 6,
             icon: Icons.info_outline_rounded,
             title: 'Hakkında',
             children: [

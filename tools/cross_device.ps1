@@ -12,11 +12,13 @@ New-Item -ItemType Directory -Force $ex | Out-Null
 $winLog = Join-Path $ex "windows.log"
 $andLog = Join-Path $ex "android.log"
 Write-Host "Takas klasoru: $ex"
+$photo = [System.IO.Path]::Combine($root, "integration_test", "fixtures", "foto_exif.jpg")
+$photoSha = (Get-FileHash -Algorithm SHA256 $photo).Hash.ToLower()
 
 $win = Start-Process -FilePath "flutter.bat" -WorkingDirectory $root -NoNewWindow -PassThru `
   -RedirectStandardOutput $winLog -RedirectStandardError "$winLog.err" `
   -ArgumentList @("test", "integration_test/cross_device_test.dart", "-d", "windows",
-                  "--dart-define=ROLE=inviter", "--dart-define=EXCHANGE=$ex")
+                  "--dart-define=ROLE=inviter", "--dart-define=EXCHANGE=$ex", "--dart-define=PHOTO=$photo")
 
 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 $inviteFile = Join-Path $ex "invite.txt"
@@ -31,7 +33,7 @@ Write-Host "Davet kodu alindi ($($invite.Length) karakter) -> Android'e veriliyo
 $and = Start-Process -FilePath "flutter.bat" -WorkingDirectory $root -NoNewWindow -PassThru `
   -RedirectStandardOutput $andLog -RedirectStandardError "$andLog.err" `
   -ArgumentList @("test", "integration_test/cross_device_test.dart", "-d", $AndroidDevice,
-                  "--dart-define=ROLE=joiner", "--dart-define=INVITE=$invite")
+                  "--dart-define=ROLE=joiner", "--dart-define=INVITE=$invite", "--dart-define=PHOTO_SHA=$photoSha")
 
 $answerFile = Join-Path $ex "answer.txt"
 while (-not (Test-Path $answerFile)) {

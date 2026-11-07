@@ -6,25 +6,168 @@ import '../../core/format.dart';
 import '../../models/models.dart';
 import '../../services/peer_session.dart';
 import '../../services/platform_actions.dart';
+import '../../services/scanner.dart';
 import '../../services/transfer_service.dart';
+import 'dialogs.dart';
 import '../theme.dart';
 import 'chrome.dart';
 import 'glass.dart';
 import 'liquid_background.dart';
 
 Color statusColor(JP jp, TaskStatus s) => switch (s) {
-      TaskStatus.done => jp.success,
-      TaskStatus.failed => jp.danger,
-      TaskStatus.canceled => jp.textFaint,
-      TaskStatus.paused => jp.warning,
-      TaskStatus.verifying => jp.accent2,
-      _ => jp.accent,
-    };
+  TaskStatus.done => jp.success,
+  TaskStatus.failed => jp.danger,
+  TaskStatus.canceled => jp.textFaint,
+  TaskStatus.paused => jp.warning,
+  TaskStatus.verifying => jp.accent2,
+  TaskStatus.scanning => jp.accent2,
+  TaskStatus.blocked => jp.danger,
+  _ => jp.accent,
+};
 
 Future<void> revealOrWarn(BuildContext context, String? path) async {
   final app = context.appRead;
   if (path == null || !await showInFolder(path)) {
     app.notify('Konum açılamadı', 'Dosya taşınmış ya da silinmiş olabilir.', error: true);
+  }
+}
+
+Future<void> shareOrWarn(BuildContext context, String? path) async {
+  final app = context.appRead;
+  if (path == null || !await shareFile(path)) {
+    app.notify('Paylaşılamadı', 'Dosya taşınmış ya da silinmiş olabilir.', error: true);
+  }
+}
+
+/// One-line scan result under a received file ("Temiz · Microsoft Defender").
+class ScanLine extends StatelessWidget {
+  const ScanLine({super.key, required this.report, this.overridden = false});
+  final ScanReport? report;
+  final bool overridden;
+
+  @override
+  Widget build(BuildContext context) {
+    final jp = context.jp;
+    final r = report;
+    if (r == null) {
+      return Text('Orijinal kalite · SHA-256 doğrulandı', style: TextStyle(color: jp.textFaint, fontSize: 11));
+    }
+    final (icon, color, text) = overridden
+        ? (Icons.gpp_maybe_rounded, jp.warning, 'Uyarıya rağmen kaydettin: ${r.summary}')
+        : switch (r.level) {
+            ThreatLevel.clean => (
+              Icons.verified_user_rounded,
+              jp.success,
+              'Temiz · ${r.engines.join(' + ')} · orijinal kalite',
+            ),
+            ThreatLevel.warning => (Icons.gpp_maybe_rounded, jp.warning, r.summary),
+            ThreatLevel.threat => (Icons.gpp_bad_rounded, jp.danger, r.summary),
+          };
+    return Row(
+      children: [
+        Icon(icon, size: 12, color: color),
+        const SizedBox(width: 4),
+        Flexible(
+          child: Text(
+            text,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(color: color, fontSize: 11),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Shown when the scanner blocked a received file: delete it or keep it anyway.
+class ThreatBanner extends StatelessWidget {
+  const ThreatBanner({super.key, required this.task});
+  final FileTask task;
+
+  Future<void> _keep(BuildContext context) async {
+    final app = context.appRead;
+    final ok = await confirm(
+      context,
+      title: 'Yine de kaydedilsin mi?',
+      message:
+          '"${task.name}" zararlı olabilir. Yalnızca gönderene ve bu dosyaya gerçekten güveniyorsan kaydet. '
+          'Kaydetsen bile JinjaPeer dosyayı asla kendiliğinden açmaz.',
+      confirmLabel: 'Riski kabul et ve kaydet',
+      danger: true,
+      icon: Icons.gpp_maybe_rounded,
+    );
+    if (ok) await app.transfers.releaseQuarantined(task);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final jp = context.jp;
+    final r = task.scanReport;
+    final gone = task.quarantinePath == null;
+    return Container(
+      padding: const EdgeInsets.all(S.md),
+      decoration: BoxDecoration(
+        color: jp.danger.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(R.md),
+        border: Border.all(color: jp.danger.withValues(alpha: 0.45)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.gpp_bad_rounded, color: jp.danger, size: 22),
+              const SizedBox(width: S.sm),
+              Expanded(
+                child: Text(
+                  'Tehdit bulundu: ${task.name}',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: context.tt.titleSmall,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: S.sm),
+          for (final f in r?.findings.where((f) => f.level != ThreatLevel.clean) ?? const <ScanFinding>[])
+            Padding(
+              padding: const EdgeInsets.only(bottom: 2),
+              child: Text('• ${f.message}', style: TextStyle(color: jp.text, fontSize: 12.5, height: 1.4)),
+            ),
+          const SizedBox(height: S.xs),
+          Text(
+            gone
+                ? 'Cihazındaki antivirüs dosyayı zaten engelledi; kaydedilecek bir şey kalmadı.'
+                : 'Dosya karantinada tutuluyor ve indirme klasörüne kaydedilmedi. Karar senin.',
+            style: TextStyle(color: jp.textMuted, fontSize: 12),
+          ),
+          const SizedBox(height: S.md),
+          Wrap(
+            alignment: WrapAlignment.end,
+            spacing: S.sm,
+            runSpacing: S.sm,
+            children: [
+              if (!gone)
+                JButton(
+                  label: 'Yine de kaydet',
+                  icon: Icons.download_rounded,
+                  kind: BtnKind.ghost,
+                  dense: true,
+                  onPressed: () => _keep(context),
+                ),
+              JButton(
+                label: gone ? 'Tamam' : 'Sil',
+                icon: gone ? Icons.check_rounded : Icons.delete_forever_rounded,
+                kind: BtnKind.danger,
+                dense: true,
+                onPressed: () => context.appRead.transfers.deleteQuarantined(task),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -61,8 +204,12 @@ class _BatchCardState extends State<BatchCard> {
     final running = b.status == BatchStatus.accepted;
     final (statusText, statusCol) = switch (b.status) {
       BatchStatus.pending => (sending ? 'Onay bekleniyor' : 'Yanıtını bekliyor', jp.warning),
-      BatchStatus.accepted => (b.paused ? (b.pausedByPeer ? 'Karşı taraf duraklattı' : 'Duraklatıldı') : (sending ? 'Gönderiliyor' : 'Alınıyor'),
-          b.paused ? jp.warning : jp.accent),
+      BatchStatus.accepted => (
+        b.paused
+            ? (b.pausedByPeer ? 'Karşı taraf duraklattı' : 'Duraklatıldı')
+            : (sending ? 'Gönderiliyor' : 'Alınıyor'),
+        b.paused ? jp.warning : jp.accent,
+      ),
       BatchStatus.done => (b.reason ?? 'Tamamlandı', b.reason == null ? jp.success : jp.warning),
       BatchStatus.rejected => ('Reddedildi', jp.danger),
       BatchStatus.canceled => ('İptal edildi', jp.textFaint),
@@ -140,13 +287,22 @@ class _BatchCardState extends State<BatchCard> {
             const SizedBox(height: S.sm),
             Row(
               children: [
-                Text('${formatBytes(done)} / ${formatBytes(total)}',
-                    style: TextStyle(color: jp.textMuted, fontSize: 12, fontFeatures: const [FontFeature.tabularFigures()])),
+                Text(
+                  '${formatBytes(done)} / ${formatBytes(total)}',
+                  style: TextStyle(
+                    color: jp.textMuted,
+                    fontSize: 12,
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                  ),
+                ),
                 const Spacer(),
                 if (running && !b.paused) ...[
                   Icon(Icons.speed_rounded, size: 14, color: jp.textFaint),
                   const SizedBox(width: 4),
-                  Text(formatSpeed(speed), style: TextStyle(color: jp.text, fontSize: 12, fontWeight: FontWeight.w600)),
+                  Text(
+                    formatSpeed(speed),
+                    style: TextStyle(color: jp.text, fontSize: 12, fontWeight: FontWeight.w600),
+                  ),
                   const SizedBox(width: S.md),
                   Icon(Icons.schedule_rounded, size: 14, color: jp.textFaint),
                   const SizedBox(width: 4),
@@ -156,6 +312,11 @@ class _BatchCardState extends State<BatchCard> {
               ],
             ),
           ],
+          for (final t in b.tasks.where((t) => t.status == TaskStatus.blocked))
+            Padding(
+              padding: const EdgeInsets.only(top: S.md),
+              child: ThreatBanner(task: t),
+            ),
           SmoothSize(
             duration: Duration(milliseconds: 220),
             curve: Curves.easeOutCubic,
@@ -195,6 +356,8 @@ class TaskRow extends StatelessWidget {
     final jp = context.jp;
     final t = task;
     final col = statusColor(jp, t.status);
+    final narrow = MediaQuery.sizeOf(context).width < 600;
+    final receivedOk = t.status == TaskStatus.done && t.path != null && t.direction == TransferDirection.receive;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 5),
       child: Row(
@@ -228,25 +391,37 @@ class TaskRow extends StatelessWidget {
                   const SizedBox(height: 4),
                   LiquidProgress(value: t.progress, height: 4, paused: t.status == TaskStatus.paused),
                 ] else if (t.error != null && t.status != TaskStatus.done)
-                  Text(t.error!, style: TextStyle(color: col, fontSize: 11)),
+                  Text(t.error!, style: TextStyle(color: col, fontSize: 11))
+                else if (t.status == TaskStatus.scanning) ...[
+                  const SizedBox(height: 4),
+                  LiquidProgress(value: 0, height: 4, indeterminate: true, color: jp.accent2),
+                ] else if (receivedOk)
+                  ScanLine(report: t.scanReport, overridden: t.userOverride),
               ],
             ),
           ),
+          if (!narrow) ...[
+            const SizedBox(width: S.sm),
+            SizedBox(
+              width: 72,
+              child: Text(
+                formatBytes(t.size),
+                textAlign: TextAlign.right,
+                style: TextStyle(color: jp.textFaint, fontSize: 11.5),
+              ),
+            ),
+          ],
           const SizedBox(width: S.sm),
           SizedBox(
-            width: 72,
-            child: Text(formatBytes(t.size),
-                textAlign: TextAlign.right, style: TextStyle(color: jp.textFaint, fontSize: 11.5)),
+            width: narrow ? 78 : 92,
+            child: Text(
+              t.status.label,
+              textAlign: TextAlign.right,
+              style: TextStyle(color: col, fontSize: 11.5, fontWeight: FontWeight.w600),
+            ),
           ),
-          const SizedBox(width: S.sm),
           SizedBox(
             width: 92,
-            child: Text(t.status.label,
-                textAlign: TextAlign.right,
-                style: TextStyle(color: col, fontSize: 11.5, fontWeight: FontWeight.w600)),
-          ),
-          SizedBox(
-            width: 68,
             child: Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
@@ -258,13 +433,23 @@ class TaskRow extends StatelessWidget {
                       size: 28,
                       onPressed: () => openOrWarn(context, t.path),
                     ),
-                  JIconButton(
-                    icon: Icons.folder_outlined,
-                    tooltip: 'Klasörde göster',
-                    size: 28,
-                    onPressed: () => revealOrWarn(context, t.path),
-                  ),
-                ] else if (!t.status.isFinal && t.batch.status == BatchStatus.accepted)
+                  if (canShareFiles && t.direction == TransferDirection.receive)
+                    JIconButton(
+                      icon: Icons.share_rounded,
+                      tooltip: 'Paylaş',
+                      size: 28,
+                      onPressed: () => shareOrWarn(context, t.path),
+                    ),
+                  if (isDesktop || t.direction == TransferDirection.receive)
+                    JIconButton(
+                      icon: Icons.folder_outlined,
+                      tooltip: revealLabel,
+                      size: 28,
+                      onPressed: () => revealOrWarn(context, t.path),
+                    ),
+                ] else if (t.status == TaskStatus.blocked)
+                  Icon(Icons.gpp_bad_rounded, size: 18, color: jp.danger)
+                else if (!t.status.isFinal && !t.status.isLocal && t.batch.status == BatchStatus.accepted)
                   JIconButton(
                     icon: Icons.close_rounded,
                     tooltip: 'Bu dosyayı iptal et',
@@ -297,7 +482,10 @@ class _RequestCardState extends State<RequestCard> {
     final app = context.appRead;
     var dest = app.downloadDir;
     if (choose || app.settings.askWhereToSave) {
-      final picked = await FilePicker.getDirectoryPath(dialogTitle: 'Dosyalar nereye kaydedilsin?', initialDirectory: dest);
+      final picked = await FilePicker.getDirectoryPath(
+        dialogTitle: 'Dosyalar nereye kaydedilsin?',
+        initialDirectory: dest,
+      );
       if (picked == null) return;
       dest = picked;
     }
@@ -324,19 +512,28 @@ class _RequestCardState extends State<RequestCard> {
         children: [
           Row(
             children: [
-              Avatar(name: contact?.name ?? b.peerName, seed: seedOf(b.peerKey), size: 42, online: b.session.state.isLive),
+              Avatar(
+                name: contact?.name ?? b.peerName,
+                seed: seedOf(b.peerKey),
+                size: 42,
+                online: b.session.state.isLive,
+              ),
               const SizedBox(width: S.md),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text.rich(TextSpan(children: [
-                      TextSpan(text: contact?.name ?? b.peerName, style: context.tt.titleSmall),
+                    Text.rich(
                       TextSpan(
-                        text: ' sana ${b.tasks.length} dosya göndermek istiyor',
-                        style: TextStyle(color: jp.textMuted, fontSize: 13.5),
+                        children: [
+                          TextSpan(text: contact?.name ?? b.peerName, style: context.tt.titleSmall),
+                          TextSpan(
+                            text: ' sana ${b.tasks.length} dosya göndermek istiyor',
+                            style: TextStyle(color: jp.textMuted, fontSize: 13.5),
+                          ),
+                        ],
                       ),
-                    ])),
+                    ),
                     const SizedBox(height: 4),
                     Wrap(
                       spacing: 6,
@@ -372,8 +569,12 @@ class _RequestCardState extends State<RequestCard> {
                         Icon(fileIcon(t.name), size: 17, color: fileColor(t.name)),
                         const SizedBox(width: S.sm),
                         Expanded(
-                          child: Text(t.relDir.isEmpty ? t.name : '${t.relDir}/${t.name}',
-                              maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12.5)),
+                          child: Text(
+                            t.relDir.isEmpty ? t.name : '${t.relDir}/${t.name}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontSize: 12.5),
+                          ),
                         ),
                         if (t.risky)
                           Padding(
@@ -422,18 +623,14 @@ class _RequestCardState extends State<RequestCard> {
                 kind: BtnKind.ghost,
                 onPressed: _busy ? null : () => app.transfers.reject(b),
               ),
-              JButton(
-                label: 'Farklı klasöre kaydet',
-                icon: Icons.drive_folder_upload_rounded,
-                kind: BtnKind.secondary,
-                onPressed: _busy ? null : () => _accept(choose: true),
-              ),
-              JButton(
-                label: 'Kabul et',
-                icon: Icons.download_rounded,
-                loading: _busy,
-                onPressed: () => _accept(),
-              ),
+              if (isDesktop)
+                JButton(
+                  label: 'Farklı klasöre kaydet',
+                  icon: Icons.drive_folder_upload_rounded,
+                  kind: BtnKind.secondary,
+                  onPressed: _busy ? null : () => _accept(choose: true),
+                ),
+              JButton(label: 'Kabul et', icon: Icons.download_rounded, loading: _busy, onPressed: () => _accept()),
             ],
           ),
         ],
@@ -483,7 +680,11 @@ class RecordTile extends StatelessWidget {
                     color: sending ? jp.accent : jp.success,
                     border: Border.all(color: jp.bgTop, width: 2),
                   ),
-                  child: Icon(sending ? Icons.north_east_rounded : Icons.south_west_rounded, size: 10, color: Colors.white),
+                  child: Icon(
+                    sending ? Icons.north_east_rounded : Icons.south_west_rounded,
+                    size: 10,
+                    color: Colors.white,
+                  ),
                 ),
               ),
             ],
@@ -510,14 +711,31 @@ class RecordTile extends StatelessWidget {
             ),
           ),
           const SizedBox(width: S.sm),
+          if (r.status == RecordStatus.completed && r.direction == TransferDirection.receive && r.scan != null)
+            Padding(
+              padding: const EdgeInsets.only(right: S.xs),
+              child: _ScanPill(note: r.scan!),
+            ),
           Pill(label, color: col),
           const SizedBox(width: S.xs),
           if (r.status == RecordStatus.completed && r.path != null) ...[
             if (!sending)
-              JIconButton(icon: Icons.open_in_new_rounded, tooltip: 'Aç', size: 30, onPressed: () => openOrWarn(context, r.path)),
+              JIconButton(
+                icon: Icons.open_in_new_rounded,
+                tooltip: 'Aç',
+                size: 30,
+                onPressed: () => openOrWarn(context, r.path),
+              ),
+            if (canShareFiles && !sending)
+              JIconButton(
+                icon: Icons.share_rounded,
+                tooltip: 'Paylaş',
+                size: 30,
+                onPressed: () => shareOrWarn(context, r.path),
+              ),
             JIconButton(
               icon: Icons.folder_outlined,
-              tooltip: 'Klasörde göster',
+              tooltip: revealLabel,
               size: 30,
               onPressed: () => revealOrWarn(context, r.path),
             ),
@@ -539,14 +757,35 @@ class RecordTile extends StatelessWidget {
               }
             },
             itemBuilder: (context) => [
-              if (r.sha256 != null)
-                const PopupMenuItem(value: 'hash', child: Text('SHA-256 özetini kopyala')),
+              if (r.sha256 != null) const PopupMenuItem(value: 'hash', child: Text('SHA-256 özetini kopyala')),
               if (r.path != null) const PopupMenuItem(value: 'path', child: Text('Dosya yolunu kopyala')),
               const PopupMenuItem(value: 'remove', child: Text('Geçmişten kaldır')),
             ],
           ),
         ],
       ),
+    );
+  }
+}
+
+class _ScanPill extends StatelessWidget {
+  const _ScanPill({required this.note});
+  final String note;
+
+  @override
+  Widget build(BuildContext context) {
+    final jp = context.jp;
+    final kind = note.split('|').first;
+    final detail = note.contains('|') ? note.substring(note.indexOf('|') + 1) : note;
+    final (text, color, icon) = switch (kind) {
+      'clean' => ('Temiz', jp.success, Icons.verified_user_rounded),
+      'warning' => ('Uyarı', jp.warning, Icons.gpp_maybe_rounded),
+      'override' => ('Riskli', jp.danger, Icons.gpp_maybe_rounded),
+      _ => ('Tehdit', jp.danger, Icons.gpp_bad_rounded),
+    };
+    return Tooltip(
+      message: detail,
+      child: Pill(text, color: color, icon: icon),
     );
   }
 }

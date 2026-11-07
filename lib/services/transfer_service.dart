@@ -30,6 +30,7 @@ import '../core/crypto.dart';
 import '../core/sanitize.dart';
 import '../models/models.dart';
 import 'peer_session.dart';
+import 'scanner.dart';
 
 const int kChunkSize = 128 * 1024;
 const int kChunksInFlight = 12;
@@ -38,9 +39,12 @@ const int kMaxPendingRequestsPerPeer = 5;
 
 enum BatchStatus { pending, accepted, rejected, canceled, done, failed }
 
-enum TaskStatus { queued, active, paused, verifying, done, failed, canceled }
+enum TaskStatus { queued, active, paused, verifying, scanning, blocked, done, failed, canceled }
 
 extension TaskStatusX on TaskStatus {
+  /// Past the network: being scanned or waiting for the user's decision.
+  bool get isLocal => this == TaskStatus.scanning || this == TaskStatus.blocked;
+
   bool get isFinal =>
       this == TaskStatus.done || this == TaskStatus.failed || this == TaskStatus.canceled;
   String get label => switch (this) {
@@ -48,6 +52,8 @@ extension TaskStatusX on TaskStatus {
         TaskStatus.active => 'Aktarılıyor',
         TaskStatus.paused => 'Duraklatıldı',
         TaskStatus.verifying => 'Doğrulanıyor',
+        TaskStatus.scanning => 'Taranıyor',
+        TaskStatus.blocked => 'Tehdit bulundu',
         TaskStatus.done => 'Tamamlandı',
         TaskStatus.failed => 'Başarısız',
         TaskStatus.canceled => 'İptal edildi',
@@ -111,6 +117,10 @@ class FileTask {
 
   // receiver internals
   RandomAccessFile? _raf;
+  Future<void>? _writing;
+  ScanReport? scanReport;
+  String? quarantinePath;
+  bool userOverride = false;
   String? _partPath;
 
   TransferDirection get direction => batch.direction;
@@ -165,6 +175,8 @@ class TransferBatch {
 
 typedef RecordSink = void Function(TransferRecord r, FileTask? t);
 typedef IncomingPolicy = Future<String?> Function(TransferBatch b);
+typedef ScanFn = Future<ScanReport?> Function(String path, String name, String sha256);
+typedef PublishFn = Future<String?> Function(FileTask t, String path);
 typedef NoticeSink = void Function(String title, String body, {bool error});
 
 class TransferService extends ChangeNotifier {
@@ -173,6 +185,9 @@ class TransferService extends ChangeNotifier {
     required this.notice,
     required this.autoAcceptDestination,
     required this.maxIncomingBytes,
+    this.scan,
+    this.quarantineDir,
+    this.publish,
   }) {
     _ticker = Timer.periodic(const Duration(milliseconds: 500), (_) => _tick());
   }
@@ -183,6 +198,14 @@ class TransferService extends ChangeNotifier {
   /// Returns a destination folder if the batch may be accepted without asking.
   final IncomingPolicy autoAcceptDestination;
   final int Function() maxIncomingBytes;
+
+  /// Malware scan for received files (null = no scanning).
+  final ScanFn? scan;
+  final String? quarantineDir;
+
+  /// Hands a finished file to the OS (Android: public Downloads). Returns
+  /// the new location (path or content:// URI) or null to keep the path.
+  final PublishFn? publish;
 
   final List<TransferBatch> batches = [];
   final Map<String, FileTask> _tasksById = {};
@@ -569,7 +592,10 @@ class TransferService extends ChangeNotifier {
         _markDirty();
       }
       if (t.status == TaskStatus.queued) t.status = TaskStatus.active;
-      await t._raf!.writeFrom(data);
+      final w = t._raf!.writeFrom(data).then((_) {});
+      t._writing = w;
+      await w;
+      if (t.status.isFinal) return; // canceled while writing; discard cleans up
       t.transferred += data.length;
     } catch (e) {
       await _failReceive(t, 'write', 'Diske yazılamadı: ${e is FileSystemException ? e.message : e}');
@@ -612,21 +638,110 @@ class TransferService extends ChangeNotifier {
         await _failReceive(t, 'hash', 'Bütünlük doğrulaması başarısız — dosya silindi');
         return;
       }
-      final dir = p.dirname(t._partPath!);
-      final finalPath = uniquePath(dir, t.name, (x) => File(x).existsSync() || Directory(x).existsSync());
-      if (!isInside(b.destination!, finalPath)) {
-        await _failReceive(t, 'write', 'Güvensiz hedef yol');
-        return;
-      }
-      await File(t._partPath!).rename(finalPath);
-      t.path = finalPath;
       t.sha256 = actual;
-      _finishTask(t, TaskStatus.done);
-      await s.sendControl({'t': 'fdone', 'id': t.idHex, 'ok': true});
+      // Scanning can take seconds; run it off the message queue so pings and
+      // other files keep flowing.
+      unawaited(_scanAndFinalize(s, t));
+      return;
     } catch (e) {
       await _failReceive(t, 'write', 'Dosya kaydedilemedi: $e');
     }
     _settleBatch(b);
+  }
+
+  Future<void> _scanAndFinalize(PeerSession s, FileTask t) async {
+    final b = t.batch;
+    try {
+      ScanReport? report;
+      if (scan != null) {
+        t.status = TaskStatus.scanning;
+        _markDirty();
+        report = await scan!(t._partPath!, t.name, t.sha256 ?? '');
+        t.scanReport = report;
+        if (t.status.isFinal) return; // canceled meanwhile
+      }
+      if (report != null && report.isThreat) {
+        t.quarantinePath = await _quarantine(t, report);
+        t.status = TaskStatus.blocked;
+        _markDirty();
+        notice('Tehdit bulundu', '${t.name}: ${report.summary}', error: true);
+        // The bytes did arrive intact; keeping or deleting is a local decision.
+        await s.sendControl({'t': 'fdone', 'id': t.idHex, 'ok': true}).catchError((_) {});
+        return;
+      }
+      await _moveToFinal(t, t._partPath!);
+      _finishTask(t, TaskStatus.done);
+      await s.sendControl({'t': 'fdone', 'id': t.idHex, 'ok': true}).catchError((_) {});
+    } catch (e) {
+      await _failReceive(t, 'write', 'Dosya kaydedilemedi: $e');
+    }
+    _settleBatch(b);
+  }
+
+  Future<void> _moveToFinal(FileTask t, String from) async {
+    final b = t.batch;
+    final dir = _targetDir(b.destination!, t.relDir);
+    await Directory(dir).create(recursive: true);
+    final finalPath = uniquePath(dir, t.name, (x) => File(x).existsSync() || Directory(x).existsSync());
+    if (!isInside(b.destination!, finalPath)) throw const FileSystemException('Güvensiz hedef yol');
+    await _move(from, finalPath);
+    t.path = finalPath;
+    if (publish != null) {
+      final published = await publish!(t, finalPath);
+      if (published != null) t.path = published;
+    }
+  }
+
+  static Future<void> _move(String from, String to) async {
+    try {
+      await File(from).rename(to);
+    } on FileSystemException {
+      // Different volume: copy, then remove the original.
+      await File(from).copy(to);
+      await File(from).delete();
+    }
+  }
+
+  Future<String?> _quarantine(FileTask t, ScanReport report) async {
+    final part = t._partPath;
+    if (part == null || report.removedByAntivirus || !await File(part).exists()) return null;
+    final dir = quarantineDir ?? p.dirname(part);
+    await Directory(dir).create(recursive: true);
+    final q = p.join(dir, '${t.idHex}.karantina');
+    try {
+      await _move(part, q);
+      return q;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// User decided to keep a file the scanner flagged.
+  Future<void> releaseQuarantined(FileTask t) async {
+    if (t.status != TaskStatus.blocked || t.quarantinePath == null) return;
+    try {
+      await _moveToFinal(t, t.quarantinePath!);
+      t.quarantinePath = null;
+      t.userOverride = true;
+      _finishTask(t, TaskStatus.done);
+    } catch (e) {
+      notice('Kaydedilemedi', '$e', error: true);
+    }
+    _settleBatch(t.batch);
+  }
+
+  /// User decided to delete a flagged file.
+  Future<void> deleteQuarantined(FileTask t) async {
+    if (t.status != TaskStatus.blocked) return;
+    final q = t.quarantinePath;
+    if (q != null) {
+      try {
+        await File(q).delete();
+      } catch (_) {}
+    }
+    t.quarantinePath = null;
+    _finishTask(t, TaskStatus.canceled, error: 'Tehdit nedeniyle silindi');
+    _settleBatch(t.batch);
   }
 
   Future<void> _failReceive(FileTask t, String code, String message) async {
@@ -642,15 +757,27 @@ class TransferService extends ChangeNotifier {
   }
 
   Future<void> _discardPart(FileTask t) async {
+    // Never close/delete while a chunk is being written (Windows cannot delete
+    // an open file; the partial file would be left behind).
     try {
-      await t._raf?.close();
+      await t._writing;
     } catch (_) {}
+    final raf = t._raf;
     t._raf = null;
-    if (t._partPath != null) {
+    try {
+      await raf?.close();
+    } catch (_) {}
+    final part = t._partPath;
+    if (part == null) return;
+    for (var i = 0; i < 20; i++) {
       try {
-        final f = File(t._partPath!);
-        if (await f.exists()) await f.delete();
-      } catch (_) {}
+        final f = File(part);
+        if (!await f.exists()) return;
+        await f.delete();
+        return;
+      } on FileSystemException {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
     }
   }
 
@@ -660,7 +787,7 @@ class TransferService extends ChangeNotifier {
     final id = m['id'];
     final targets = id is String ? b.tasks.where((t) => t.idHex == id) : b.tasks;
     for (final t in targets.toList()) {
-      if (t.status.isFinal) continue;
+      if (t.status.isFinal || t.status.isLocal) continue;
       if (b.direction == TransferDirection.receive) {
         _discardPart(t);
         s.dropFileHash(t.idHex);
@@ -680,6 +807,8 @@ class TransferService extends ChangeNotifier {
 
   Future<void> cancelTask(FileTask t) async {
     if (t.status.isFinal) return;
+    if (t.status == TaskStatus.blocked) return deleteQuarantined(t);
+    if (t.status == TaskStatus.scanning) return;
     final b = t.batch;
     if (t.direction == TransferDirection.receive) {
       await _discardPart(t);
@@ -701,7 +830,7 @@ class TransferService extends ChangeNotifier {
     b.status = BatchStatus.canceled;
     b.reason = 'İptal ettin';
     for (final t in b.tasks) {
-      if (t.status.isFinal) continue;
+      if (t.status.isFinal || t.status.isLocal) continue;
       if (b.direction == TransferDirection.receive) {
         await _discardPart(t);
         b.session.dropFileHash(t.idHex);
@@ -747,7 +876,7 @@ class TransferService extends ChangeNotifier {
     for (final b in batches.where((b) => identical(b.session, s)).toList()) {
       if (b.isFinished) continue;
       for (final t in b.tasks) {
-        if (t.status.isFinal) continue;
+        if (t.status.isFinal || t.status.isLocal) continue;
         if (b.direction == TransferDirection.receive) _discardPart(t);
         _finishTask(t, b.status == BatchStatus.pending ? TaskStatus.canceled : TaskStatus.failed,
             error: 'Bağlantı kesildi',
@@ -801,6 +930,9 @@ class TransferService extends ChangeNotifier {
         sha256: t.sha256,
         error: status == TaskStatus.done ? null : error,
         batchId: t.batch.reqId,
+        scan: t.scanReport == null
+            ? null
+            : (t.userOverride ? 'override|${t.scanReport!.summary}' : t.scanReport!.note),
       ),
       t,
     );

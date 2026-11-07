@@ -159,11 +159,13 @@ class SessionKeys {
   /// 32 byte key for frames we receive.
   final Uint8List receiveKey;
 
-  /// 40-bit short authentication string, shown as "ABCD-EFGH" on both sides.
+  /// 60-bit short authentication string, shown as "ABCD-EFGH-JKMN" on both
+  /// sides. 60 bits make it infeasible for a man-in-the-middle to grind keys
+  /// until both sides happen to show the same code.
   final String verificationCode;
 }
 
-const _pbkdfIterations = 120000;
+const _pbkdfIterations = 200000;
 
 Future<Uint8List> _passwordKey(String password, Uint8List salt) {
   // PBKDF2 is CPU heavy – keep the UI fluid by running it in a worker.
@@ -209,18 +211,18 @@ Future<SessionKeys> deriveSessionKeys({
   final offerToAnswer = Uint8List.fromList(okm.sublist(0, 32));
   final answerToOffer = Uint8List.fromList(okm.sublist(32, 64));
 
-  final sasHkdf = Hkdf(hmac: Hmac.sha256(), outputLength: 8);
+  final sasHkdf = Hkdf(hmac: Hmac.sha256(), outputLength: 10);
   final sasBytes = await (await sasHkdf.deriveKey(
     secretKey: SecretKey(dh),
     nonce: transcript,
     info: utf8.encode('JinjaPeer/1 verification'),
   ))
       .extractBytes();
-  final sas = base32(sasBytes, 8);
+  final sas = base32(sasBytes, 12);
 
   return SessionKeys(
     sendKey: isOfferer ? offerToAnswer : answerToOffer,
     receiveKey: isOfferer ? answerToOffer : offerToAnswer,
-    verificationCode: '${sas.substring(0, 4)}-${sas.substring(4)}',
+    verificationCode: '${sas.substring(0, 4)}-${sas.substring(4, 8)}-${sas.substring(8)}',
   );
 }

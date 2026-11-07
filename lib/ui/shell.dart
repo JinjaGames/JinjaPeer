@@ -85,7 +85,9 @@ class _ShellState extends State<Shell> {
             onDragDone: _onDrop,
             child: Stack(
               children: [
-                Column(
+                SafeArea(
+                  bottom: false,
+                  child: Column(
                   children: [
                     TitleBar(
                       leading: wide
@@ -118,6 +120,7 @@ class _ShellState extends State<Shell> {
                     ),
                     if (!wide) const _BottomNav(),
                   ],
+                ),
                 ),
                 IgnorePointer(
                   child: AnimatedOpacity(

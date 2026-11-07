@@ -8,7 +8,10 @@ import 'package:path_provider/path_provider.dart';
 import '../core/codes.dart';
 import '../core/crypto.dart';
 import '../models/models.dart';
+import '../core/format.dart';
+import 'android_bridge.dart';
 import 'peer_session.dart';
+import 'scanner.dart';
 import 'storage.dart';
 import 'transfer_service.dart';
 
@@ -36,6 +39,10 @@ class AppController extends ChangeNotifier {
   final Identity identity;
   final AppSettings settings;
   late final TransferService transfers;
+  late final MalwareScanner scanner = MalwareScanner(() => ScanOptions(
+        enabled: settings.scanEnabled,
+        virusTotalKey: settings.virusTotalKey,
+      ));
 
   final List<PeerSession> sessions = [];
   final List<Contact> contacts = [];
@@ -119,14 +126,58 @@ class AppController extends ChangeNotifier {
         t,
         b,
         error: error,
-        action: t == 'Yeni dosya isteği' ? () => page.value = AppPage.requests : null,
+        action: switch (t) {
+          'Yeni dosya isteği' => () => page.value = AppPage.requests,
+          'Tehdit bulundu' => () => page.value = AppPage.transfers,
+          _ => null,
+        },
         actionLabel: 'Görüntüle',
       ),
       autoAcceptDestination: _autoAcceptDestination,
       maxIncomingBytes: () => settings.maxIncomingGb * 1024 * 1024 * 1024,
+      scan: (path, name, sha) => scanner.scanFile(path, displayName: name, sha256: sha),
+      quarantineDir: p.join(_store.root.path, 'karantina'),
+      publish: AndroidBridge.available ? _publishAndroid : null,
     );
     transfers.addListener(notifyListeners);
+    if (AndroidBridge.available) transfers.addListener(_syncAndroidService);
     _expiryTimer = Timer.periodic(const Duration(seconds: 5), (_) => _checkExpiry());
+  }
+
+  /// Android: finished files go to the public Downloads/JinjaPeer folder.
+  Future<String?> _publishAndroid(FileTask t, String path) async {
+    try {
+      final r = await AndroidBridge.saveToDownloads(path, t.name, t.relDir);
+      return r?['uri'];
+    } catch (_) {
+      return null; // stays in the app folder; still openable/shareable
+    }
+  }
+
+  bool _serviceOn = false;
+  DateTime _serviceUpdated = DateTime(2000);
+
+  /// Keeps an Android foreground service (with progress notification) alive
+  /// while anything is transferring, so it continues in the background.
+  void _syncAndroidService() {
+    final running = transfers.active.where((b) => b.tasks.any((t) => !t.status.isFinal)).toList();
+    if (running.isEmpty) {
+      if (_serviceOn) {
+        _serviceOn = false;
+        AndroidBridge.transferStopped().catchError((_) {});
+      }
+      return;
+    }
+    final now = DateTime.now();
+    if (_serviceOn && now.difference(_serviceUpdated) < const Duration(seconds: 2)) return;
+    _serviceUpdated = now;
+    _serviceOn = true;
+    final total = running.fold<int>(0, (a, b) => a + b.totalSize);
+    final done = running.fold<int>(0, (a, b) => a + b.transferred);
+    final speed = running.fold<double>(0, (a, b) => a + b.speed);
+    final pct = total == 0 ? 0 : (done * 100 ~/ total);
+    final text = '${running.length} aktarım · %$pct · ${formatSpeed(speed)}';
+    AndroidBridge.transferRunning(text, pct).catchError((_) {});
   }
 
   String get downloadDir =>

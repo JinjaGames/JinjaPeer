@@ -49,6 +49,9 @@ typedef ControlHandler = Future<void> Function(PeerSession s, Map<String, dynami
 typedef ChunkHandler = Future<void> Function(
     PeerSession s, String fileIdHex, int offset, Uint8List data);
 
+/// Largest encrypted frame we accept (128 KiB chunk + headers + margin).
+const int kMaxFrameBytes = 160 * 1024;
+
 class PeerSession extends ChangeNotifier {
   PeerSession._({
     required this.id,
@@ -396,6 +399,10 @@ class PeerSession extends ChangeNotifier {
       if (!m.isBinary) return; // only encrypted binary frames are accepted
       final data = m.binary;
       bytesIn += data.length;
+      if (data.length > kMaxFrameBytes) {
+        _set(SessionState.failed, err: 'Güvenlik ihlali: beklenenden büyük paket alındı. Bağlantı kesildi.');
+        return;
+      }
       final ch = _channel;
       if (ch == null || _state.isOver) return;
       // Decryption starts right away (the worker keeps strict order);

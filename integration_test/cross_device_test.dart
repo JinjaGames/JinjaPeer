@@ -4,8 +4,12 @@
 // carried between the two test processes by tools/cross_device.ps1, exactly
 // like a user would copy-paste them. Real STUN servers are used.
 //
-//   ROLE=inviter  EXCHANGE=<folder>        (Windows: writes invite.txt, waits for answer.txt)
-//   ROLE=joiner   INVITE=<invite code>     (Android: prints ANSWER_CODE:<code>)
+//   ROLE=inviter  EXCHANGE=<folder>                      (Windows)
+//   ROLE=joiner   INVITE=<invite code> PHOTO_SHA=<hex>   (Android)
+//
+// Windows → Android: a 24 MB file + a real EXIF photo (must arrive bit-identical,
+// get scanned and land in the phone's public Downloads/JinjaPeer folder).
+// Android → Windows: a 12 MB file.
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
@@ -15,13 +19,17 @@ import 'package:integration_test/integration_test.dart';
 import 'package:jinja_peer/core/codes.dart';
 import 'package:jinja_peer/core/crypto.dart';
 import 'package:jinja_peer/models/models.dart';
+import 'package:jinja_peer/services/android_bridge.dart';
 import 'package:jinja_peer/services/peer_session.dart';
+import 'package:jinja_peer/services/scanner.dart';
 import 'package:jinja_peer/services/transfer_service.dart';
 import 'package:path_provider/path_provider.dart';
 
 const role = String.fromEnvironment('ROLE');
 const exchange = String.fromEnvironment('EXCHANGE');
 const inviteText = String.fromEnvironment('INVITE');
+const photoSha = String.fromEnvironment('PHOTO_SHA');
+const photoPath = String.fromEnvironment('PHOTO');
 const password = 'kopru-2026';
 
 const ice = [
@@ -60,8 +68,14 @@ String candidateSummary(String sdp) {
   return types.toString();
 }
 
-Future<void> runTransfers(PeerSession s, Directory inbox, {required bool sendFirst}) async {
+Future<String?> _publish(FileTask t, String path) async {
+  final r = await AndroidBridge.saveToDownloads(path, t.name, t.relDir);
+  return r == null ? null : r['uri'];
+}
+
+Future<void> runTransfers(PeerSession s, Directory inbox) async {
   final received = <TransferRecord>[];
+  final scanner = MalwareScanner(() => const ScanOptions());
   final ts = TransferService(
     onRecord: (r, _) {
       if (r.direction == TransferDirection.receive) received.add(r);
@@ -69,43 +83,49 @@ Future<void> runTransfers(PeerSession s, Directory inbox, {required bool sendFir
     notice: (t, m, {error = false}) => log('bildirim: $t – $m'),
     autoAcceptDestination: (_) async => inbox.path,
     maxIncomingBytes: () => 0,
+    scan: (path, name, sha) => scanner.scanFile(path, displayName: name, sha256: sha),
+    publish: AndroidBridge.available ? _publish : null,
   );
   ts.attach(s);
 
-  final outName = role == 'inviter' ? 'windows_gonderdi.bin' : 'android_gonderdi.bin';
-  final outBytes = role == 'inviter' ? payload(1, winSize) : payload(2, andSize);
-  final expectIn = role == 'inviter' ? payload(2, andSize) : payload(1, winSize);
-  final inName = role == 'inviter' ? 'android_gonderdi.bin' : 'windows_gonderdi.bin';
-  final src = File('${inbox.parent.path}/$outName')..writeAsBytesSync(outBytes);
-
-  Future<void> send() async {
+  Future<void> send(List<File> files) async {
     final sw = Stopwatch()..start();
-    final b = (await ts.offer(s, [SendSource.fromFile(src)]))!;
+    final total = files.fold<int>(0, (a, f) => a + f.lengthSync());
+    final b = (await ts.offer(s, [for (final f in files) SendSource.fromFile(f)]))!;
     await waitFor(() => b.isFinished, const Duration(minutes: 5), 'gönderim');
     sw.stop();
-    log('GÖNDERİM ${b.status.name} ${(outBytes.length / 1048576 / (sw.elapsedMilliseconds / 1000)).toStringAsFixed(1)} MB/s '
-        '(${sw.elapsedMilliseconds} ms)');
+    log('GÖNDERİM ${b.status.name}: ${files.length} dosya, ${(total / 1048576).toStringAsFixed(1)} MB, '
+        '${(total / 1048576 / (sw.elapsedMilliseconds / 1000)).toStringAsFixed(1)} MB/s');
     expect(b.status, BatchStatus.done, reason: b.reason);
   }
 
-  Future<void> receive() async {
+  if (role == 'inviter') {
+    final big = File('${inbox.parent.path}/windows_gonderdi.bin')..writeAsBytesSync(payload(1, winSize));
+    await send([big, File(photoPath)]);
+
     await waitFor(() => received.isNotEmpty, const Duration(minutes: 5), 'alım');
     final r = received.single;
     expect(r.status, RecordStatus.completed, reason: r.error);
-    final got = await File('${inbox.path}/$inName').readAsBytes();
-    expect(got.length, expectIn.length);
-    expect(hex(await sha256(got)), hex(await sha256(expectIn)));
-    log('ALIM tamam, SHA-256 eşleşti: ${r.sha256}');
-  }
-
-  if (sendFirst) {
-    await send();
-    await receive();
+    final got = await File('${inbox.path}/android_gonderdi.bin').readAsBytes();
+    expect(hex(await sha256(got)), hex(await sha256(payload(2, andSize))));
+    log('ALIM tamam, SHA-256 eşleşti · tarama: ${r.scan}');
   } else {
-    await receive();
-    await send();
+    await waitFor(() => received.length >= 2, const Duration(minutes: 5), 'alım');
+    final bin = received.firstWhere((r) => r.fileName == 'windows_gonderdi.bin');
+    final photo = received.firstWhere((r) => r.fileName.endsWith('.jpg'));
+    for (final r in [bin, photo]) {
+      expect(r.status, RecordStatus.completed, reason: r.error);
+      log('ALINDI ${r.fileName} → ${r.path} · tarama: ${r.scan}');
+      expect(r.path, startsWith('content://'), reason: 'must be in public Downloads');
+      expect(await AndroidBridge.exists(r.path!), isTrue);
+    }
+    expect(bin.sha256, hex(await sha256(payload(1, winSize))));
+    expect(photo.sha256, photoSha, reason: 'photo must be bit-identical (original quality)');
+    log('FOTOĞRAF orijinal kalitede: SHA-256 birebir aynı ($photoSha)');
+
+    final back = File('${inbox.parent.path}/android_gonderdi.bin')..writeAsBytesSync(payload(2, andSize));
+    await send([back]);
   }
-  // Let the last confirmations travel before closing.
   await Future<void>.delayed(const Duration(seconds: 2));
   ts.dispose();
 }
@@ -158,9 +178,9 @@ void main() {
       await waitFor(() => s.state.isLive || s.state.isOver, const Duration(minutes: 3), 'bağlantı');
       expect(s.state, SessionState.connected, reason: s.error);
       await Future<void>.delayed(const Duration(seconds: 1));
-      log('BAĞLANDI: karşı=${s.peerName} doğrulama=${s.verificationCode} rota=${s.routeInfo} rtt=${s.rttMs}');
+      log('BAĞLANDI: karşı=${s.peerName} doğrulama=${s.verificationCode} rota=${s.routeInfo}');
 
-      await runTransfers(s, inbox, sendFirst: role == 'inviter');
+      await runTransfers(s, inbox);
       log('SONUÇ: BAŞARILI');
       await s.close();
       await tmp.delete(recursive: true);

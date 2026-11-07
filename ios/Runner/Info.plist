@@ -10,6 +10,8 @@
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<key>UIFileSharingEnabled</key>
+	<true/>
 	<key>CFBundleDisplayName</key>
 	<string>JinjaPeer</string>
 	<key>CFBundleExecutable</key>

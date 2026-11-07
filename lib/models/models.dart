@@ -20,7 +20,11 @@ class TransferRecord {
     this.sha256,
     this.error,
     this.batchId,
+    this.scan,
   });
+
+  /// Scan outcome: "clean|...", "warning|...", "threat|..." or "override|...".
+  final String? scan;
 
   final String id;
   final TransferDirection direction;
@@ -58,6 +62,7 @@ class TransferRecord {
         'sha': sha256,
         'err': error,
         'batch': batchId,
+        'scan': scan,
       };
 
   static TransferRecord fromJson(Map<String, dynamic> j) => TransferRecord(
@@ -74,6 +79,7 @@ class TransferRecord {
         sha256: j['sha'] as String?,
         error: j['err'] as String?,
         batchId: j['batch'] as String?,
+        scan: j['scan'] as String?,
       );
 }
 
@@ -156,7 +162,12 @@ class AppSettings {
     this.reduceMotion = false,
     this.onboarded = false,
     this.keepFolderStructure = true,
+    this.scanEnabled = true,
+    this.virusTotalKey = '',
   });
+
+  bool scanEnabled;
+  String virusTotalKey;
 
   String displayName;
   String downloadDir;
@@ -190,6 +201,8 @@ class AppSettings {
         'reduceMotion': reduceMotion,
         'onboarded': onboarded,
         'keepTree': keepFolderStructure,
+        'scan': scanEnabled,
+        'vtKey': virusTotalKey,
       };
 
   static AppSettings fromJson(Map<String, dynamic> j) => AppSettings(
@@ -208,5 +221,7 @@ class AppSettings {
         reduceMotion: j['reduceMotion'] as bool? ?? false,
         onboarded: j['onboarded'] as bool? ?? false,
         keepFolderStructure: j['keepTree'] as bool? ?? true,
+        scanEnabled: j['scan'] as bool? ?? true,
+        virusTotalKey: j['vtKey'] as String? ?? '',
       );
 }
